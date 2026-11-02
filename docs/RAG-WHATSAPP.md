@@ -45,10 +45,30 @@ Resposta:
   "gestante_id": 5001,
   "gestante_id_publico": "G-5001",
   "chunks": [{ "source": "consulta", "title": "Consulta #3", "text": "...", "score": 1.25 }],
-  "contexto_texto": "Documentos recuperados...",
+  "contexto_texto": "PatientSnapshot + documentos + histórico...",
+  "patient_snapshot": {
+    "primeiro_nome": "Caroline",
+    "idade_gestacional": "22",
+    "pressao_sistolica": 110,
+    "analise_resumo": "risco moderado; eco recomendada",
+    "interpretacao_resumo": "..."
+  },
+  "historico_conversa": [
+    { "role": "user", "text": "Oi", "at": "2026-10-29T19:00:00-03:00" },
+    { "role": "staff", "text": "Olá, aqui é a equipe.", "at": "2026-10-29T19:01:00-03:00" }
+  ],
+  "intencao": "conversa_livre",
   "total_fontes": 10
 }
 ```
+
+O `Montar_prompt` no n8n:
+- injeta **sempre** o contexto clínico (`contexto_texto` / PatientSnapshot), não só em `exames_consultas`;
+- funde `historico_conversa` (Laravel) com o histórico Supabase — falas `staff` viram turns `model` com prefixo `[Mensagem da equipe]`.
+
+Intenções Laravel: `conversa_livre` | `sintoma` | `exames_consultas` | `atendimento_humano` | `falar_medico` | `fora_escopo`.
+
+Escopo: canal só para gestantes. Declaração “não estou mais grávida” → Laravel `resposta_pronta` + n8n envia sem Gemini. RAG expõe `gestacao_ativa` / `fora_escopo`. Prompt anti-vícios (sem consentimento repetido, sem inventar contexto, disclaimer no máx. 1x).
 
 Teste:
 
@@ -105,11 +125,21 @@ npx supabase db reset
 # ou rode o SQL 006 no Studio
 ```
 
+## Fallback de modelos Gemini (cota 429)
+
+Ordem padrão (configurável):
+
+1. `GEMINI_MODEL` (ex.: `gemini-3.5-flash-lite`)
+2. `GEMINI_MODEL_FALLBACKS` — lista CSV, default: `gemini-3.1-flash-lite,gemini-3.6-flash,gemini-3.8-flash`
+
+O nó **Gemini_API** (Code) tenta o próximo modelo **somente em HTTP 429 / quota**. Outros erros (401, 400…) não fazem fallback.
+
 ## Limitações desta fase
 
 - Retrieval por **palavras-chave**, não embedding semântico ainda.
 - PDF/OCR: indexe o **texto já extraído** com `whatsapp:rag-index`.
 - Sem consentimento / ticket fechado, o IF do n8n não chega no RAG+Gemini.
+- PatientSnapshot + histórico Laravel (20 msgs) entram em **todas** as intenções; chunks completos de documentos/exames continuam priorizados em `exames_consultas`.
 
 ## Arquivos principais
 

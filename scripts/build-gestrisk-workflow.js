@@ -286,6 +286,8 @@ return [
       laravel_gestante_id: ok && body ? body.gestante_id : null,
       fluxo_respondido,
       pular_ia,
+      resposta_pronta: respostaPronta || null,
+      intencao_laravel: ok && body ? body.intencao || null : null,
       fluxo_estado: ok && body ? body.fluxo_estado || null : null,
     },
   },
@@ -400,10 +402,14 @@ const consentimento = String(sess.consentimento || 'pending');
 const semana =
   memoria.semana_gestacional != null ? String(memoria.semana_gestacional) : '';
 
-// RAG Laravel (prontuário + documentos indexados)
+// RAG Laravel (PatientSnapshot + prontuário + historico_conversa)
 let ragTexto = '';
 let ragFound = false;
 let ragIntencao = '';
+let ragSnapshot = null;
+let ragHistorico = [];
+let ragGestacaoAtiva = true;
+let ragForaEscopo = false;
 try {
   const ragItem = $('Laravel_RAG').first().json;
   let rb = ragItem && (ragItem.body !== undefined ? ragItem.body : ragItem);
@@ -414,6 +420,10 @@ try {
     ragFound = !!rb.found;
     ragIntencao = String(rb.intencao || '');
     ragTexto = String(rb.contexto_texto || '');
+    ragSnapshot = rb.patient_snapshot && typeof rb.patient_snapshot === 'object' ? rb.patient_snapshot : null;
+    ragHistorico = Array.isArray(rb.historico_conversa) ? rb.historico_conversa : [];
+    ragGestacaoAtiva = rb.gestacao_ativa !== false;
+    ragForaEscopo = !!rb.fora_escopo || ragIntencao === 'fora_escopo';
     if (!gestante_id && rb.gestante_id != null) {
       gestante_id = String(rb.gestante_id);
     }
@@ -422,59 +432,133 @@ try {
   ragTexto = '';
 }
 
-const usarProntuario = ragIntencao === 'exames_consultas';
-const regrasRag = usarProntuario
-  ? [
-      'Regras do RAG: use só o que estiver nesses trechos; se não houver dado, diga que não há registro no prontuário; não invente exames, consultas, datas, horários, locais, profissionais ou resultados.',
-      'Nunca interprete exames, faça diagnóstico, recomende medicamentos ou classifique sintomas como normais/graves.',
-      'Não complete informações ausentes com conhecimento médico geral. Não altere dados das APIs.',
-    ].join('\n')
-  : '';
+const detalheExames = ragIntencao === 'exames_consultas';
+const regrasRag = [
+  'ESCOPO: Cardioprenatal é para gestantes em acompanhamento (rastreio de cardiopatias congênitas). Quem já está cadastrada neste chat deve ser acolhida como gestante do serviço.',
+  'Há contexto clínico (PatientSnapshot / RAG; found=' + String(ragFound) + ', intencao=' + (ragIntencao || 'conversa_livre') + ', gestacao_ativa=' + String(ragGestacaoAtiva) + ', fora_escopo=' + String(ragForaEscopo) + ').',
+  'gestacao_ativa=false só significa que falta IG/consulta no prontuário — NÃO use isso para encerrar nem dizer que ela não está grávida.',
+  'Use só o que estiver nos trechos; se não houver dado, diga com carinho que não há registro e ofereça a equipe. Não invente exames, datas, locais, passeios.',
+  'Nunca interprete exames, faça diagnóstico ou indique medicamento.',
+  ragForaEscopo
+    ? 'FORA DE ESCOPO (ela DECLAROU que não está mais grávida): acolha com empatia, diga que o canal é para gestantes em acompanhamento, oriente UBS/equipe e encerrar_ticket=true.'
+    : '',
+  detalheExames
+    ? 'Pedido de exames/consultas: priorize trechos do prontuário.'
+    : 'Em conversa livre/sintoma: use o snapshot e o histórico; fale de perto, como quem acompanha o pré-natal.',
+].filter(Boolean).join('\n');
 
-const prior = Array.isArray(historicoCarregado) ? historicoCarregado.slice(-24) : [];
+function normTxt(t) {
+  return String(t || '')
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 200);
+}
+
+function turnText(turn) {
+  const parts = turn && Array.isArray(turn.parts) ? turn.parts : [];
+  return parts.map((p) => (p && p.text != null ? String(p.text) : '')).join(' ');
+}
+
+const priorSupabase = Array.isArray(historicoCarregado) ? historicoCarregado.slice(-24) : [];
+const seen = new Set(priorSupabase.map((t) => normTxt(turnText(t))).filter(Boolean));
+
+// Funde mensagens Laravel (esp. equipe na ficha) que ainda não estão no historico Supabase.
+const fusedExtra = [];
+for (const h of ragHistorico) {
+  const text = String(h && h.text != null ? h.text : '').trim();
+  if (!text) continue;
+  const key = normTxt(text);
+  if (key && seen.has(key)) continue;
+  if (key) seen.add(key);
+  const roleLaravel = String(h.role || 'assistant');
+  if (roleLaravel === 'user') {
+    fusedExtra.push({ role: 'user', parts: [{ text }] });
+  } else if (roleLaravel === 'staff') {
+    fusedExtra.push({
+      role: 'model',
+      parts: [{ text: '[Mensagem da equipe] ' + text }],
+    });
+  } else {
+    fusedExtra.push({ role: 'model', parts: [{ text }] });
+  }
+}
+
+const prior = priorSupabase.concat(fusedExtra).slice(-24);
 const contents = prior.concat([{ role: 'user', parts: [{ text: msg }] }]);
 
+const snapshotLine = ragSnapshot
+  ? 'PatientSnapshot (JSON Laravel): ' + JSON.stringify(ragSnapshot)
+  : 'PatientSnapshot: não disponível nesta mensagem.';
+
+const primeiroNomeSnap =
+  ragSnapshot && ragSnapshot.primeiro_nome != null && String(ragSnapshot.primeiro_nome).trim() !== ''
+    ? String(ragSnapshot.primeiro_nome).trim()
+    : (memoria && memoria.nome ? String(memoria.nome).split(/\s+/)[0] : '');
+
 const systemText = [
-  'Você é uma assistente de saúde para gestantes, com postura de obstetra experiente: acolhedora, clara e objetiva.',
-  'Fale em português do Brasil, linguagem simples. Evite termos técnicos sem explicação curta.',
-  'Respostas CURTAS: 2 a 5 frases no campo resposta_paciente. Sem listas longas.',
-  'Use o histórico em contents, a memória e o contexto abaixo. NÃO repita perguntas já respondidas (nome, sintomas, consentimento).',
+  'Você é a assistente do Cardioprenatal: companheira de cuidado para gestantes no rastreio de cardiopatias congênitas.',
+  'Canal EXCLUSIVO para gestantes em acompanhamento — mas quem já está cadastrada aqui é tratada como gestante do serviço, mesmo se faltar IG no prontuário.',
+  '',
+  'TOM ÍNTIMO (obrigatório):',
+  '- Fale como uma profissional que conhece a gestante: calorosa, próxima, humana — nunca robótica nem “script de call center”.',
+  primeiroNomeSnap
+    ? '- Use o primeiro nome (“' + primeiroNomeSnap + '”) de forma natural (não em toda frase).'
+    : '- Se souber o nome na memória/snapshot, use-o com carinho; se não souber, pergunte uma vez.',
+  '- Mostre que está ouvindo: retome o que ela acabou de dizer em 1 pedaço curto (“entendi que a dor começou ontem…”).',
+  '- Em saudação ou “como você está?”, responda com afeto e já puxe o fio do pré-natal (“estou aqui com você — como está se sentindo hoje na gestação?”).',
+  '- Em sintoma: acolha de verdade antes de perguntar; 1 pergunta por vez, tom de quem acompanha, não de formulário.',
+  '- Varie o jeito de falar; evite respostas idênticas e frases prontas repetidas.',
+  '- Português do Brasil, linguagem simples. 2 a 4 frases. Sem inventar histórias, passeios ou detalhes que ela não escreveu.',
+  '',
+  'Use o histórico, a memória e o PatientSnapshot. NÃO repita perguntas já respondidas (nome, sintomas, consentimento).',
+  'Turns [Mensagem da equipe] vieram da ficha — respeite.',
+  '',
+  'ANTI-VÍCIOS DE IA:',
+  '- NÃO peça consentimento de novo se já for accepted.',
+  '- NÃO repita “não substitui consulta” em toda mensagem (no máx. 1x se ainda não apareceu no histórico).',
+  '- NÃO invente contexto (balão, viagem, esporte, comida) se ela não falou.',
+  '- NÃO diga que a gestação “não está ativa” só porque falta idade gestacional no sistema — isso NÃO encerra o atendimento.',
+  '- Papo casual leve: responda com carinho em 1–2 frases e gentilmente volte ao cuidado (“pode me contar se está se sentindo bem na gestação?”).',
+  '- Só fora de escopo / encerrar se ela DECLARAR que não está (mais) grávida OU pedir para parar: acolha, oriente equipe/UBS, encerrar_ticket=true.',
+  '- Dúvida genérica (“posso engravidar?”) de quem já está no cadastro: acolha e explique o papel do canal no pré-natal; não encerre.',
   '',
   'Memória atual (JSON): ' + JSON.stringify(memoria),
+  snapshotLine,
   'Consentimento LGPD atual: ' + consentimento,
-  semana ? 'Semana gestacional conhecida: ' + semana + '. Adapte o tom à fase da gravidez.' : 'Semana gestacional ainda desconhecida.',
+  semana ? 'Semana gestacional conhecida: ' + semana + '. Adapte o tom à fase da gravidez.' : 'Semana gestacional ainda desconhecida — pode perguntar com carinho se fizer sentido.',
   '',
-  usarProntuario ? 'RAG / prontuário (fonte Laravel; found=' + String(ragFound) + '):' : 'Conversa (sem prontuário nesta mensagem):',
-  ragTexto || (usarProntuario ? 'Sem trechos RAG disponíveis nesta mensagem.' : 'Converse de forma acolhedora. Não consulte o prontuário nesta mensagem.'),
+  'Contexto clínico Laravel (sempre disponível quando found=true):',
+  ragTexto || 'Sem trechos RAG / PatientSnapshot textuais nesta mensagem.',
   regrasRag,
   '',
   'Regras de segurança:',
   '- Nunca prescreva medicamentos, doses ou condutas invasivas.',
-  '- Reforce, com naturalidade, que este canal NÃO substitui consulta presencial com a equipe de saúde.',
-  '- NÃO use no texto ao paciente palavras alarmistas como: emergência, emergencial, urgente, urgência, agora (no sentido de alarme), imediato, correr.',
-  '- Se a situação parecer grave (classifique gravidade=high), oriente com calma a procurar a unidade de saúde / equipe de referência, sem alarmismo.',
+  '- NÃO use palavras alarmistas: emergência, emergencial, urgente, urgência, imediato, correr.',
+  '- Se gravidade=high, oriente com calma a procurar a unidade / equipe de referência, sem alarmismo.',
   '',
-  'Consentimento (obrigatório na 1ª interação se consentimento=pending):',
-  '- Explique em 1–2 frases que podemos guardar dados do atendimento para acompanhar melhor.',
-  '- Peça resposta clara: SIM ou NÃO.',
-  '- Se a mensagem atual já for sim/não, preencha consentimento_resposta e siga.',
+  'Consentimento (SOMENTE se consentimento=pending):',
+  '- Em 1 frase peça SIM ou NÃO para guardar dados do atendimento.',
+  '- Se a mensagem atual já for sim/não, preencha consentimento_resposta e siga SEM repetir o pedido.',
+  '- Se consentimento=accepted ou declined, NÃO mencione consentimento.',
   '',
-  'Encerrar ticket: se a pessoa pedir para finalizar/encerrar/parar o atendimento, encerrar_ticket=true e uma despedida curta.',
+  'Encerrar ticket: finalizar/encerrar/parar OU fora de escopo (não gestante) → encerrar_ticket=true e despedida curta.',
   '',
-  'Extraia dados clínicos e de perfil quando existirem na mensagem ou no contexto (memoria_patch + consulta).',
-  'O IMC NÃO deve aparecer no JSON (é calculado no banco se houver peso/altura).',
+  'Extraia dados clínicos só se estiverem na mensagem ou no contexto (memoria_patch + consulta).',
+  'O IMC NÃO deve aparecer no JSON.',
   '',
   'Classificação interna (não verbalizar alarmismo):',
   '- pressao_sistolica >= 160 → gravidade high',
   '- glicemia >= 180 → gravidade high',
   '- doppler_umbilical == 2 → gravidade high',
+  '- visão escurecendo / desmaio / sangramento intenso → gravidade high',
   '',
   'IMPORTANTE: responda APENAS com JSON válido, sem markdown e sem texto fora do JSON.',
   '',
   'Formato:',
   '{',
   '  "resposta_paciente": "string",',
-  '  "intencao": "sintoma|medida|duvida|saudacao|consentimento|encerrar|outro",',
+  '  "intencao": "sintoma|medida|duvida|saudacao|consentimento|encerrar|fora_escopo|outro",',
   '  "gravidade": "low|mid|high",',
   '  "consentimento_resposta": "sim|nao|null",',
   '  "encerrar_ticket": false,',
@@ -531,6 +615,101 @@ return [
     },
   },
 ];`;
+
+const geminiComFallback = String.raw`const mp = $('Montar_prompt').first().json;
+const geminiBody = mp.geminiBody;
+const apiKey = String($env.GEMINI_API_KEY || '').trim();
+if (!apiKey) {
+  throw new Error('GEMINI_API_KEY ausente');
+}
+if (!geminiBody || typeof geminiBody !== 'object') {
+  throw new Error('geminiBody ausente no Montar_prompt');
+}
+
+const primary = String($env.GEMINI_MODEL || 'gemini-3.5-flash-lite').trim();
+const fromEnv = String($env.GEMINI_MODEL_FALLBACKS || 'gemini-3.1-flash-lite,gemini-3.6-flash,gemini-3.8-flash')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+const models = [];
+for (const m of [primary, ...fromEnv]) {
+  if (m && !models.includes(m)) models.push(m);
+}
+
+function isQuotaError(e) {
+  const status =
+    e?.statusCode ||
+    e?.httpCode ||
+    e?.response?.statusCode ||
+    e?.response?.status ||
+    e?.cause?.statusCode;
+  const msg = String(e?.message || e?.description || e?.statusMessage || '');
+  return Number(status) === 429 || /429|RESOURCE_EXHAUSTED|quota|Too Many Requests|rate.?limit/i.test(msg);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+const helpers = this.helpers;
+const tentativas = [];
+
+return (async () => {
+  let lastErr = null;
+  for (let i = 0; i < models.length; i++) {
+    const model = models[i];
+    const url =
+      'https://generativelanguage.googleapis.com/v1beta/models/' +
+      encodeURIComponent(model) +
+      ':generateContent?key=' +
+      encodeURIComponent(apiKey);
+    try {
+      const data = await helpers.httpRequest({
+        method: 'POST',
+        url,
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: geminiBody,
+        json: true,
+        timeout: 120000,
+      });
+      tentativas.push({ model, ok: true });
+      return [
+        {
+          json: {
+            ...(data && typeof data === 'object' ? data : { raw: data }),
+            gemini_model_used: model,
+            gemini_fallback_tentativas: tentativas,
+          },
+        },
+      ];
+    } catch (e) {
+      lastErr = e;
+      const quota = isQuotaError(e);
+      tentativas.push({
+        model,
+        ok: false,
+        quota,
+        error: String(e?.message || e).slice(0, 240),
+      });
+      if (!quota) {
+        throw new Error(
+          'Gemini falhou em ' + model + ' (sem fallback): ' + String(e?.message || e).slice(0, 400),
+        );
+      }
+      // 429: espera um pouco e tenta o próximo modelo da lista
+      if (i < models.length - 1) {
+        await sleep(1200);
+      }
+    }
+  }
+
+  throw new Error(
+    'Gemini: todos os modelos esgotaram cota (429). Tentativas: ' +
+      JSON.stringify(tentativas) +
+      ' | último: ' +
+      String(lastErr?.message || lastErr).slice(0, 300),
+  );
+})();`;
 
 const montarResposta = String.raw`const prep = $('Mesclar_Laravel_gestante').first().json;
 const mp = $('Montar_prompt').first().json;
@@ -672,6 +851,41 @@ return (async () => {
   ];
 })();`;
 
+const respostaProntaLaravel = String.raw`const prep = $('Mesclar_Laravel_gestante').first().json;
+const text = String(prep.resposta_pronta || '').trim();
+// pular_ia sem texto = pausa humana (equipe na ficha): não envia nada pelo n8n
+if (!text) {
+  return [];
+}
+
+const nowIso = new Date().toISOString();
+const encerrar = String(prep.intencao_laravel || '') === 'fora_escopo';
+
+return [
+  {
+    json: {
+      resposta_paciente: text,
+      telefone: prep.telefone,
+      chatId: prep.chatId,
+      session: prep.session,
+      gestante_id: prep.gestante_id || '',
+      sessao_body: {
+        chat_id: prep.chatId,
+        gestante_id: prep.gestante_id || null,
+        status: encerrar ? 'closed_user' : 'open',
+        consentimento: 'pending',
+        ultima_interacao_em: nowIso,
+        fechado_em: encerrar ? nowIso : null,
+        historico: [
+          { role: 'user', parts: [{ text: String(prep.message || '') }] },
+          { role: 'model', parts: [{ text }] },
+        ],
+        memoria: {},
+      },
+    },
+  },
+];`;
+
 const respostaEncerramento = String.raw`const prep = $('Mesclar_Laravel_gestante').first().json;
 const sess = $('Supabase_GET_sessao').first().json;
 const nowIso = new Date().toISOString();
@@ -723,7 +937,7 @@ const workflow = {
       parameters: {
         httpMethod: 'POST',
         path: 'gestrisk-whatsapp',
-        responseMode: 'responseNode',
+        responseMode: 'onReceived',
         options: {},
       },
       id: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
@@ -807,6 +1021,14 @@ const workflow = {
       position: [520, -160],
     },
     {
+      parameters: { mode: 'runOnceForAllItems', jsCode: respostaProntaLaravel },
+      id: 'resp-pronta-laravel-01',
+      name: 'Resposta_pronta_laravel',
+      type: 'n8n-nodes-base.code',
+      typeVersion: 2,
+      position: [720, -80],
+    },
+    {
       parameters: { mode: 'runOnceForAllItems', jsCode: supabaseGet },
       id: 'b3c4d5e6-f7a8-9012-bcde-f23456789012',
       name: 'Supabase_GET_sessao',
@@ -881,22 +1103,12 @@ const workflow = {
       position: [1140, -400],
     },
     {
-      parameters: {
-        method: 'POST',
-        url: "=https://generativelanguage.googleapis.com/v1beta/models/{{ $env.GEMINI_MODEL || 'gemini-flash-latest' }}:generateContent?key={{ $env.GEMINI_API_KEY }}",
-        sendBody: true,
-        specifyBody: 'json',
-        jsonBody: '={{ JSON.stringify($json.geminiBody) }}',
-        options: { timeout: 120000 },
-      },
+      parameters: { mode: 'runOnceForAllItems', jsCode: geminiComFallback },
       id: 'd4e5f6a7-b8c9-0123-def0-234567890123',
       name: 'Gemini_API',
-      type: 'n8n-nodes-base.httpRequest',
-      typeVersion: 4.2,
+      type: 'n8n-nodes-base.code',
+      typeVersion: 2,
       position: [1320, -400],
-      retryOnFail: true,
-      maxTries: 5,
-      waitBetweenTries: 5000,
     },
     {
       parameters: { mode: 'runOnceForAllItems', jsCode: montarResposta },
@@ -961,7 +1173,7 @@ const workflow = {
         sendBody: true,
         specifyBody: 'json',
         jsonBody:
-          "={{ JSON.stringify($('Montar_resposta').isExecuted ? $('Montar_resposta').first().json.sessao_body : $('Resposta_encerramento').first().json.sessao_body) }}",
+          "={{ JSON.stringify($('Montar_resposta').isExecuted ? $('Montar_resposta').first().json.sessao_body : ($('Resposta_pronta_laravel').isExecuted ? $('Resposta_pronta_laravel').first().json.sessao_body : $('Resposta_encerramento').first().json.sessao_body)) }}",
         options: {},
       },
       id: 'f6a7b8c9-d0e1-2345-f012-456789012345',
@@ -978,7 +1190,7 @@ const workflow = {
         sendBody: true,
         specifyBody: 'json',
         jsonBody:
-          "={{ JSON.stringify({ session: ($('Montar_resposta').isExecuted ? $('Montar_resposta').first().json.session : $('Resposta_encerramento').first().json.session), chatId: ($('Montar_resposta').isExecuted ? $('Montar_resposta').first().json.chatId : $('Resposta_encerramento').first().json.chatId), text: ($('Montar_resposta').isExecuted ? $('Montar_resposta').first().json.resposta_paciente : $('Resposta_encerramento').first().json.resposta_paciente) }) }}",
+          "={{ JSON.stringify({ session: ($('Montar_resposta').isExecuted ? $('Montar_resposta').first().json.session : ($('Resposta_pronta_laravel').isExecuted ? $('Resposta_pronta_laravel').first().json.session : $('Resposta_encerramento').first().json.session)), chatId: ($('Montar_resposta').isExecuted ? $('Montar_resposta').first().json.chatId : ($('Resposta_pronta_laravel').isExecuted ? $('Resposta_pronta_laravel').first().json.chatId : $('Resposta_encerramento').first().json.chatId)), text: ($('Montar_resposta').isExecuted ? $('Montar_resposta').first().json.resposta_paciente : ($('Resposta_pronta_laravel').isExecuted ? $('Resposta_pronta_laravel').first().json.resposta_paciente : $('Resposta_encerramento').first().json.resposta_paciente)) }) }}",
         options: {},
       },
       id: 'b8c9d0e1-f2a3-4567-1234-678901234567',
@@ -987,18 +1199,6 @@ const workflow = {
       typeVersion: 4.2,
       position: [2040, -280],
       continueOnFail: true,
-    },
-    {
-      parameters: {
-        respondWith: 'json',
-        responseBody: '={{ JSON.stringify({ ok: true }) }}',
-        options: {},
-      },
-      id: 'c9d0e1f2-a3b4-5678-2345-789012345678',
-      name: 'Respond_Webhook',
-      type: 'n8n-nodes-base.respondToWebhook',
-      typeVersion: 1.1,
-      position: [2220, -280],
     },
   ],
   connections: {
@@ -1012,9 +1212,12 @@ const workflow = {
     },
     IF_pular_ia_laravel: {
       main: [
-        [{ node: 'Respond_Webhook', type: 'main', index: 0 }],
+        [{ node: 'Resposta_pronta_laravel', type: 'main', index: 0 }],
         [{ node: 'Supabase_GET_sessao', type: 'main', index: 0 }],
       ],
+    },
+    Resposta_pronta_laravel: {
+      main: [[{ node: 'Laravel_log_saida', type: 'main', index: 0 }]],
     },
     Supabase_GET_sessao: {
       main: [[{ node: 'IF_continuar_gemini', type: 'main', index: 0 }]],
@@ -1038,7 +1241,6 @@ const workflow = {
     Supabase_save_sessao: {
       main: [[{ node: 'WAHA_sendText', type: 'main', index: 0 }]],
     },
-    WAHA_sendText: { main: [[{ node: 'Respond_Webhook', type: 'main', index: 0 }]] },
   },
   pinData: {},
   settings: { executionOrder: 'v1', binaryMode: 'separate' },

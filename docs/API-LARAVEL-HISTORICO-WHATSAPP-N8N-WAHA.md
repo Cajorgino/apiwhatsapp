@@ -149,7 +149,7 @@ Os nós **Laravel_log_*** chamam `POST /api/v1/n8n/whatsapp/mensagens/{telefone}
 |----------|-----------|
 | `LARAVEL_APP_URL` | URL base do Laravel **sem** barra final (ex.: `http://host.docker.internal:8000`). |
 | `WAHA_WEBHOOK_SECRET` | Mesmo valor do Laravel — header `X-Webhook-Secret`. |
-| `GEMINI_API_KEY` / `GEMINI_MODEL` | Modelo recomendado: `gemini-flash-latest`. |
+| `GEMINI_API_KEY` / `GEMINI_MODEL` | Modelo recomendado: `gemini-3.6-flash`. |
 | `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` | Projeto Supabase + service role. |
 
 **SQL no Supabase:** `003_gestrisk_sessoes.sql` + `004_gestrisk_sessoes_consentimento.sql` (status, timeout, consentimento, memória, cadastro LGPD).

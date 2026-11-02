@@ -34,7 +34,9 @@ services:
       N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
       # Workflow GestRisk (Gemini + Supabase) — preencha no .env
       # Modelo REST (evite *-preview em produção — costumam dar 503 sob pico de demanda)
-      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3-flash-preview}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.5-flash-lite}
+      # Lista separada por vírgula; em 429 o nó Gemini_API tenta o próximo
+      GEMINI_MODEL_FALLBACKS: ${GEMINI_MODEL_FALLBACKS:-gemini-3.1-flash-lite,gemini-3.6-flash,gemini-3.8-flash}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       SUPABASE_URL: ${SUPABASE_URL:-}
       SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY:-}

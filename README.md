@@ -112,7 +112,7 @@ Arquivo pronto para importar: `workflows/GestRisk-WAHA-Gemini-Supabase.json`.
 | `GESTRISK_DEFAULT_GESTANTE_ID` | `gestante_id` usado quando o telefone da paciente não estiver no mapa do nó Code (ex. `GEST-001`). |
 | `LARAVEL_APP_URL` | Base do backend Laravel **sem** barra final (ex. `http://host.docker.internal:8000` com n8n no Docker e Laravel no PC). Os nós **Laravel_log_*** usam `POST /api/v1/n8n/whatsapp/mensagens/{telefone}`. |
 | `WAHA_WEBHOOK_SECRET` | Opcional; se definido no Laravel, use o mesmo valor (header `X-Webhook-Secret`). |
-| `GEMINI_MODEL` | Padrão recomendado: `gemini-flash-latest`. |
+| `GEMINI_MODEL` | Padrão recomendado: `gemini-3.6-flash`. |
 
 Depois de editar o `.env`: `docker compose up -d n8n`.
 
@@ -167,7 +167,7 @@ Campos principais: `resposta_paciente`, `intencao`, `gravidade`, `consentimento_
 
 ### Modelo Gemini
 
-Defina `GEMINI_MODEL=gemini-flash-latest` no `.env` (validado com a chave atual).
+Defina `GEMINI_MODEL=gemini-3.6-flash` no `.env` (validado com a chave atual).
 
 ## Credenciais externas no n8n
 
